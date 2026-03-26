@@ -1,40 +1,47 @@
-// TrainerLights Server
-// Author: khader afeez
-// khaderafeez16@gmail.com
 // ============================================================
-// TrainerLights SERVER - NodeMCU ESP-12E (V1.0 FINAL)
+// TrainerLights SERVER - ESP32 WROOM-32D (V1.0 FINAL)
+// Ported from NodeMCU ESP8266
 // Features: Mobile UI, Ghost-Test Fix, Clear Stats, Node Memory
-// abin abraham
-// abinabraham176@gmail.com
 // ============================================================
 
-#include <ESP8266mDNS.h>
-#include <DNSServer.h>
+// ---- REQUIRED LIBRARIES (install via Arduino Library Manager) ----
+// WebSockets          by Markus Sattler  (arduinoWebSockets)
+// ArduinoJson         by Benoit Blanchon (v6.x)
+// LinkedList          by Ivan Seidel
+// TaskScheduler       by Anatoli Arkhipenko
+
+// MUST be defined before any include so the WebSockets library picks it up
+#define WEBSOCKETS_SERVER_CLIENT_MAX 10
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WebServer.h>
 #include <WebSocketsServer.h>
-#include <ESP8266WebServer.h>
 #include <TaskScheduler.h>
 #include <ArduinoJson.h>
 #include <LinkedList.h>
 #include <pgmspace.h>
 
-extern "C" {
-#include "user_interface.h"
-}
+// ESP32 WiFi headers (included via WiFi.h)
+#include "esp_wifi.h"
 
+// ============================================================
+// Sensor class
+// ============================================================
 class Sensor {
   public:
     IPAddress ip;
     String    mac;
     int       nodeID;
-    uint8_t   num;
+    int       num;   // WebSocket slot number — int to match library type
     bool      enabled;
 };
 
 LinkedList<Sensor*> sensorList = LinkedList<Sensor*>();
-uint8_t appConnected = 255;
+int appConnected = -1;  // -1 = no app connected
 
-ESP8266WebServer webServer(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
+WebServer        webServer(80);
+WebSocketsServer  webSocket = WebSocketsServer(81);
 
 const char* apName     = "TrainerLights";
 const char* apPassword = "1234567890";
@@ -49,16 +56,16 @@ int max_detection_range = 50;
 int timeout_ms          = 1000;
 int tdelay              = 0;
 
-bool isTesting    = false;
-int  currentSensor= 0;
-int  lastSensor   = -1;
-bool stimulating  = false;
+bool isTesting     = false;
+int  currentSensor = 0;
+int  lastSensor    = -1;
+bool stimulating   = false;
 
 int   test_score        = 0;
 int   test_errors       = 0;
-long  sum_response_time = 0; 
-long  sum_distance      = 0; 
-int   hit_count         = 0; 
+long  sum_response_time = 0;
+long  sum_distance      = 0;
+int   hit_count         = 0;
 int   max_distance      = 0;
 int   min_distance      = 9999;
 int   max_response_time = 0;
@@ -66,12 +73,19 @@ int   min_response_time = 9999;
 int   avg_response_time = 0;
 int   avg_distance      = 0;
 
+// ============================================================
+// Task Scheduler
+// ============================================================
 Scheduler ts;
 void onStimulusTimeout();
 Task tStimulusTimeout(5000, TASK_ONCE, &onStimulusTimeout, &ts, false);
 
+// Forward declaration
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 
+// ============================================================
+// Helpers
+// ============================================================
 int getNextNodeID() {
   int maxID = 0;
   for (int i = 0; i < sensorList.size(); i++) {
@@ -80,38 +94,58 @@ int getNextNodeID() {
   return maxID + 1;
 }
 
-void sendSensorList(uint8_t toSocket) {
-  StaticJsonDocument<512> doc;
+void sendSensorList(int toSocket) {
+  StaticJsonDocument<1024> doc;
   doc["type"]  = "sensor_list";
   doc["count"] = sensorList.size();
   JsonArray arr = doc.createNestedArray("sensors");
   for (int i = 0; i < sensorList.size(); i++) {
-    Sensor* s   = sensorList.get(i);
+    Sensor* s = sensorList.get(i);
     JsonObject o = arr.createNestedObject();
-    o["node_id"] = s->nodeID; o["ip"] = s->ip.toString(); o["mac"] = s->mac; o["socket"] = s->num; o["index"] = i + 1;
+    o["node_id"] = s->nodeID;
+    o["ip"]      = s->ip.toString();
+    o["mac"]     = s->mac;
+    o["socket"]  = s->num;
+    o["index"]   = i + 1;
   }
-  String msg; serializeJson(doc, msg);
-  webSocket.sendTXT(toSocket, msg);
+  String msg;
+  serializeJson(doc, msg);
+  webSocket.sendTXT((uint8_t)toSocket, msg);
 }
 
 void resetStats() {
-  test_score = 0; test_errors = 0; sum_response_time = 0; sum_distance = 0; hit_count = 0; 
-  max_distance = 0; min_distance = 9999; max_response_time = 0; min_response_time = 9999;
-  avg_response_time = 0; avg_distance = 0;
+  test_score        = 0;
+  test_errors       = 0;
+  sum_response_time = 0;
+  sum_distance      = 0;
+  hit_count         = 0;
+  max_distance      = 0;
+  min_distance      = 9999;
+  max_response_time = 0;
+  min_response_time = 9999;
+  avg_response_time = 0;
+  avg_distance      = 0;
 }
 
 void sendStats() {
-  if (appConnected == 255) return;
+  if (appConnected == -1) return;
   StaticJsonDocument<256> doc;
-  doc["type"] = "stats"; doc["test_score"] = test_score; doc["test_errors"] = test_errors;
-  doc["max_distance"] = max_distance; doc["min_distance"] = (min_distance == 9999) ? 0 : min_distance;
-  doc["avg_distance"] = avg_distance; doc["max_response_time"] = max_response_time;
-  doc["min_response_time"] = (min_response_time == 9999) ? 0 : min_response_time; doc["avg_response_time"] = avg_response_time;
-  String msg; serializeJson(doc, msg); webSocket.sendTXT(appConnected, msg);
+  doc["type"]             = "stats";
+  doc["test_score"]       = test_score;
+  doc["test_errors"]      = test_errors;
+  doc["max_distance"]     = max_distance;
+  doc["min_distance"]     = (min_distance == 9999) ? 0 : min_distance;
+  doc["avg_distance"]     = avg_distance;
+  doc["max_response_time"] = max_response_time;
+  doc["min_response_time"] = (min_response_time == 9999) ? 0 : min_response_time;
+  doc["avg_response_time"] = avg_response_time;
+  String msg;
+  serializeJson(doc, msg);
+  webSocket.sendTXT((uint8_t)appConnected, msg);
 }
 
 // ============================================================
-// MODERN MOBILE WEB APP
+// MODERN MOBILE WEB APP  (stored in flash / PROGMEM)
 // ============================================================
 const char PAGE_HEAD[] PROGMEM = R"=====(
 <!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>TrainerLights</title>
@@ -179,16 +213,31 @@ const char PAGE_STATS[] PROGMEM = R"=====(
 )=====";
 
 const char PAGE_NODES[] PROGMEM = R"=====(
-<div class='card'><h2>Hardware Nodes</h2>
+<div class='card'>
+<h2>Hardware Nodes</h2>
 <div class='srow'>
   <span class='cbadge' id='nc'>Scanning...</span>
   <button class='btn btn-gray' style='width:auto;padding:8px 16px;margin:0;font-size:13px;' onclick='reqList()'>Refresh</button>
 </div>
-<div class='half'>
+<div class='half' style='margin-bottom:14px;'>
   <button class='btn btn-blue' style='font-size:14px;' onclick='blinkAll()'>Test Lights</button>
-  <button class='btn btn-red' style='font-size:14px;' onclick='clearNodes()'>Clear Nodes</button>
+  <button class='btn btn-red' style='font-size:14px;' onclick='clearNodes()'>Clear All</button>
 </div>
-<div class='node-grid' id='ng'><div class='empty'>Waiting for nodes...</div></div></div>
+<style>
+.node-list{display:flex;flex-direction:column;gap:10px;max-height:500px;overflow-y:auto;padding-right:4px;}
+.node-list::-webkit-scrollbar{width:4px;}
+.node-list::-webkit-scrollbar-thumb{background:#ccc;border-radius:4px;}
+.nrow{display:flex;align-items:center;background:#f8fff9;border:2px solid #34c759;border-radius:12px;padding:12px 14px;gap:12px;}
+.nbadge{background:#34c759;color:#fff;font-size:18px;font-weight:800;min-width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;}
+.ninfo{flex:1;min-width:0;}
+.nname{font-size:15px;font-weight:700;color:#1a5c2a;}
+.ndetail{font-size:12px;color:#666;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.nstatus{font-size:11px;background:#d4f8c4;color:#1a5c2a;border-radius:6px;padding:3px 8px;font-weight:600;white-space:nowrap;}
+.nremove{background:#ff3b30;color:#fff;border:none;border-radius:8px;width:34px;height:34px;font-size:20px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;line-height:1;}
+.nremove:active{opacity:0.7;}
+</style>
+<div class='node-list' id='ng'><div class='empty'>Waiting for nodes...</div></div>
+</div>
 )=====";
 
 const char PAGE_SETTINGS[] PROGMEM = R"=====(
@@ -219,11 +268,25 @@ function blinkAll(){ send({type:'blink_all'}); }
 function clearNodes(){ if(confirm('Erase all connected nodes?')) send({type:'clear_nodes'}); }
 function clearStats(){ send({type:'clear_stats'}); }
 
+function removeNode(mac){
+  if(confirm('Remove this node?')) send({type:'remove_node',mac:mac});
+}
 function showNodes(d){
   var g=document.getElementById('ng'); var b=document.getElementById('nc'); var n=d.sensors?d.sensors.length:0;
   if(n===0){ b.textContent='0 Nodes'; b.className='cbadge'; g.innerHTML="<div class='empty'>No nodes connected. Turn on hardware.</div>"; return; }
   b.textContent=n+' Node'+(n>1?'s':'')+' Active'; b.className='cbadge ok'; var h='';
-  for(var i=0;i<d.sensors.length;i++){ var s=d.sensors[i]; h+="<div class='node-card'><div class='nid'>"+s.node_id+"</div><div class='ntag'>Connected</div><div class='nip'>"+s.ip+"</div></div>"; }
+  for(var i=0;i<d.sensors.length;i++){
+    var s=d.sensors[i];
+    h+="<div class='nrow'>"+
+       "<div class='nbadge'>"+s.node_id+"</div>"+
+       "<div class='ninfo'>"+
+         "<div class='nname'>Node "+s.node_id+"</div>"+
+         "<div class='ndetail'>"+s.ip+"</div>"+
+       "</div>"+
+       "<span class='nstatus'>&#9679; Live</span>"+
+       "<button class='nremove' onclick=\"removeNode('"+s.mac+"')\" title='Remove node'>&#x2715;</button>"+
+       "</div>";
+  }
   g.innerHTML=h;
 }
 function showStats(d){
@@ -255,25 +318,69 @@ connect();
 </script></body></html>
 )=====";
 
+// ============================================================
+// HTTP Handler
+// ============================================================
 void handleRoot() {
-  webServer.send(200,"text/html", String(PAGE_HEAD) + String(PAGE_STATS) + String(PAGE_NODES) + String(PAGE_SETTINGS) + String(PAGE_JS));
+  // Concatenate PROGMEM strings — on ESP32 String(FPSTR(...)) is the safe approach
+  String page = String(FPSTR(PAGE_HEAD))
+              + String(FPSTR(PAGE_STATS))
+              + String(FPSTR(PAGE_NODES))
+              + String(FPSTR(PAGE_SETTINGS))
+              + String(FPSTR(PAGE_JS));
+  webServer.send(200, "text/html", page);
 }
 
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  struct softap_config cfg; wifi_softap_get_config(&cfg); cfg.max_connection = 8; wifi_softap_set_config(&cfg);
-  wifi_set_sleep_type(NONE_SLEEP_T);
-  WiFi.mode(WIFI_AP); WiFi.softAP(apName, apPassword);
+  delay(100);
+
+  // ---- Configure WiFi AP ----
+  WiFi.mode(WIFI_AP);
   
-  webSocket.begin(); webSocket.onEvent(webSocketEvent);
-  webServer.on("/", handleRoot); webServer.begin();
+  // Arguments: SSID, Password, Channel (1), Hidden (0 = false), Max Connections (10)
+  WiFi.softAP(apName, apPassword, 1, 0, 10);
+
+  // Keep Max TX power (optional, 0.25 dBm units) if you need the boost for range
+  esp_wifi_set_max_tx_power(84);          
+
+  // Disable modem sleep so WebSocket polling is reliable
+  WiFi.setSleep(false);
+
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // ---- Start mDNS (optional: reach via http://trainerlights.local) ----
+  if (MDNS.begin("trainerlights")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS started: trainerlights.local");
+  }
+
+  // ---- Start WebSocket & HTTP servers ----
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  webSocket.enableHeartbeat(15000, 3000, 2); // ping every 15s, pong timeout 3s, 2 retries
+
+  webServer.on("/", handleRoot);
+  webServer.begin();
+
+  Serial.println("TrainerLights ESP32 ready.");
 }
 
+// ============================================================
+// LOOP
+// ============================================================
 void loop() {
-  webSocket.loop(); webServer.handleClient(); ts.execute();
+  webSocket.loop();
+  webServer.handleClient();
+  ts.execute();
 
   if (!stimulating && isTesting && sensorList.size() > 0) {
     int sz = sensorList.size();
+
     if (tmode == "random") {
       int pick = random(0, sz);
       if (sz > 1) { while (pick == lastSensor) pick = random(0, sz); }
@@ -283,107 +390,201 @@ void loop() {
     }
 
     timeout_ms = (mim_timeout == max_timeout) ? mim_timeout : random(mim_timeout, max_timeout + 1);
-    tdelay     = (min_delay == max_delay) ? min_delay : random(min_delay, max_delay + 1);
-    if (timeout_ms < 100)  timeout_ms = 100;
-    if (tdelay     < 0)    tdelay     = 0;
+    tdelay     = (min_delay   == max_delay)   ? min_delay   : random(min_delay,   max_delay   + 1);
+    if (timeout_ms < 100) timeout_ms = 100;
+    if (tdelay     < 0)   tdelay     = 0;
 
-    lastSensor = currentSensor; Sensor* s  = sensorList.get(currentSensor);
+    lastSensor = currentSensor;
+    Sensor* s  = sensorList.get(currentSensor);
 
     if (s) {
-      StaticJsonDocument<200> doc; doc["type"] = "stimulus"; doc["node_id"] = s->nodeID; doc["timeout"] = timeout_ms; doc["delay"] = tdelay; doc["min_detection_range"] = min_detection_range; doc["max_detection_range"] = max_detection_range;
-      String msg; serializeJson(doc, msg); webSocket.sendTXT(s->num, msg);
-      tStimulusTimeout.setInterval(tdelay + timeout_ms + 1000); tStimulusTimeout.restartDelayed();
+      StaticJsonDocument<200> doc;
+      doc["type"]                = "stimulus";
+      doc["node_id"]             = s->nodeID;
+      doc["timeout"]             = timeout_ms;
+      doc["delay"]               = tdelay;
+      doc["min_detection_range"] = min_detection_range;
+      doc["max_detection_range"] = max_detection_range;
+      String msg;
+      serializeJson(doc, msg);
+      webSocket.sendTXT(s->num, msg);
+
+      tStimulusTimeout.setInterval(tdelay + timeout_ms + 1000);
+      tStimulusTimeout.restartDelayed();
       stimulating = true;
     }
   }
 }
 
+// ============================================================
+// WebSocket Event Handler
+// ============================================================
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   IPAddress ip = webSocket.remoteIP(num);
+
   switch (type) {
+
     case WStype_DISCONNECTED:
+      // If the app disconnects, clear appConnected so we stop sending to dead socket
+      if ((int)num == appConnected) {
+        appConnected = -1;
+      }
+      // If a sensor node disconnects, remove it from the list
       for (int i = 0; i < sensorList.size(); i++) {
-        if (sensorList.get(i)->num == num) { sensorList.remove(i); if (appConnected != 255) sendSensorList(appConnected); break; }
+        if (sensorList.get(i)->num == (int)num) {
+          sensorList.remove(i);
+          if (appConnected != -1) sendSensorList(appConnected);
+          break;
+        }
       }
       break;
-    case WStype_CONNECTED: break;
-    case WStype_TEXT: {
-      StaticJsonDocument<400> root;
-      if (deserializeJson(root, payload)) break;
-      const char* jtype = root["type"]; if (!jtype) break;
 
+    case WStype_CONNECTED:
+      break;
+
+    case WStype_TEXT: {
+      StaticJsonDocument<512> root;  // enough for all incoming message types
+      if (deserializeJson(root, payload)) break;
+      const char* jtype = root["type"];
+      if (!jtype) break;
+
+      // ---- Node registers itself ----
       if (strcmp(jtype, "sensor") == 0) {
-        String mac = root["mac"] | String("unknown"); int sentID = root["node_id"] | 0; bool found = false;
+        String mac    = root["mac"] | String("unknown");
+        int    sentID = root["node_id"] | 0;
+        bool   found  = false;
+
         for (int i = 0; i < sensorList.size(); i++) {
           if (sensorList.get(i)->mac == mac) {
-            sensorList.get(i)->num = num; sensorList.get(i)->ip = ip; found = true;
-            StaticJsonDocument<64> a; a["type"] = "assign_id"; a["node_id"] = sensorList.get(i)->nodeID;
-            String m; serializeJson(a, m); webSocket.sendTXT(num, m); break;
+            sensorList.get(i)->num = num;
+            sensorList.get(i)->ip  = ip;
+            found = true;
+            StaticJsonDocument<64> a;
+            a["type"]    = "assign_id";
+            a["node_id"] = sensorList.get(i)->nodeID;
+            String m; serializeJson(a, m);
+            webSocket.sendTXT(num, m);
+            break;
           }
         }
         if (!found) {
-          Sensor* ns = new Sensor(); ns->ip = ip; ns->mac = mac; ns->num = num; ns->enabled = true;
+          Sensor* ns  = new Sensor();
+          ns->ip      = ip;
+          ns->mac     = mac;
+          ns->num     = num;
+          ns->enabled = true;
           if (sentID > 0) {
             bool taken = false;
-            for (int i = 0; i < sensorList.size(); i++) { if (sensorList.get(i)->nodeID == sentID) { taken = true; break; } }
+            for (int i = 0; i < sensorList.size(); i++) {
+              if (sensorList.get(i)->nodeID == sentID) { taken = true; break; }
+            }
             ns->nodeID = taken ? getNextNodeID() : sentID;
-          } else { ns->nodeID = getNextNodeID(); }
+          } else {
+            ns->nodeID = getNextNodeID();
+          }
           sensorList.add(ns);
-          StaticJsonDocument<64> a; a["type"] = "assign_id"; a["node_id"] = ns->nodeID;
-          String m; serializeJson(a, m); webSocket.sendTXT(num, m);
+          StaticJsonDocument<64> a;
+          a["type"]    = "assign_id";
+          a["node_id"] = ns->nodeID;
+          String m; serializeJson(a, m);
+          webSocket.sendTXT(num, m);
         }
-        if (appConnected != 255) sendSensorList(appConnected);
+        if (appConnected != -1) sendSensorList(appConnected);
       }
 
+      // ---- App requests node list ----
       if (strcmp(jtype, "list_sensors") == 0) sendSensorList(num);
 
+      // ---- Node sends hit/miss response ----
       if (strcmp(jtype, "response") == 0) {
-        tStimulusTimeout.disable(); stimulating = false;
-        int error = root["error"] | 0; int rtime = root["time"] | 0; int rdist = root["distance"] | 0;
+        tStimulusTimeout.disable();
+        stimulating = false;
+        int error = root["error"]    | 0;
+        int rtime = root["time"]     | 0;
+        int rdist = root["distance"] | 0;
 
-        if (error == 1) { test_errors++; } else {
-          test_score++; hit_count++;
+        if (error == 1) {
+          test_errors++;
+        } else {
+          test_score++;
+          hit_count++;
           if (rtime > max_response_time) max_response_time = rtime;
           if (rtime < min_response_time) min_response_time = rtime;
           if (rdist > max_distance) max_distance = rdist;
           if (rdist < min_distance && rdist > 0) min_distance = rdist;
-          sum_response_time += rtime; sum_distance += rdist;
-          avg_response_time = (int)(sum_response_time / hit_count); avg_distance = (int)(sum_distance / hit_count);
+          sum_response_time += rtime;
+          sum_distance      += rdist;
+          avg_response_time  = (int)(sum_response_time / hit_count);
+          avg_distance       = (int)(sum_distance      / hit_count);
         }
         sendStats();
       }
 
+      // ---- Test control ----
       if (strcmp(jtype, "start_test") == 0) { isTesting = true; lastSensor = -1; }
-      if (strcmp(jtype, "stop_test") == 0) { isTesting = false; stimulating = false; tStimulusTimeout.disable(); }
-      
-      // CLEAR ONLY THE DETAILS (STATS)
+      if (strcmp(jtype, "stop_test")  == 0) { isTesting = false; stimulating = false; tStimulusTimeout.disable(); }
+
+      // ---- Clear stats only ----
       if (strcmp(jtype, "clear_stats") == 0) { resetStats(); sendStats(); }
-      
-      if (strcmp(jtype, "clear_nodes") == 0) { sensorList.clear(); sendSensorList(appConnected); }
 
-      // PREVENTS GHOST TESTS ON PAGE REFRESH
-      if (strcmp(jtype, "app_connected") == 0) { 
-        appConnected = num; 
-        isTesting = false; stimulating = false; tStimulusTimeout.disable();
-        sendSensorList(appConnected); 
+      // ---- Clear all nodes ----
+      if (strcmp(jtype, "clear_nodes") == 0) { sensorList.clear(); if(appConnected != -1) sendSensorList(appConnected); }
+
+      // ---- Remove a single node by MAC ----
+      if (strcmp(jtype, "remove_node") == 0) {
+        String targetMac = root["mac"] | String("");
+        for (int i = 0; i < sensorList.size(); i++) {
+          if (sensorList.get(i)->mac == targetMac) {
+            sensorList.remove(i);
+            break;
+          }
+        }
+        sendSensorList(appConnected);
       }
-      
-      if (strcmp(jtype, "blink_all") == 0) { for (int i = 0; i < sensorList.size(); i++) webSocket.sendTXT(sensorList.get(i)->num, "{\"type\":\"blink\"}"); }
 
+      // ---- App (re)connected — prevent ghost tests on page refresh ----
+      if (strcmp(jtype, "app_connected") == 0) {
+        appConnected = num;
+        isTesting    = false;
+        stimulating  = false;
+        tStimulusTimeout.disable();
+        sendSensorList(appConnected);
+      }
+
+      // ---- Blink all nodes (lamp test) ----
+      if (strcmp(jtype, "blink_all") == 0) {
+        for (int i = 0; i < sensorList.size(); i++)
+          webSocket.sendTXT(sensorList.get(i)->num, "{\"type\":\"blink\"}");
+      }
+
+      // ---- Push new config to server & flash all nodes ----
       if (strcmp(jtype, "config") == 0) {
-        tmode = String((const char*)root["tmode"]); min_delay = root["min_delay"] | 0; max_delay = root["max_delay"] | 500;
-        mim_timeout = root["mim_timeout"] | 1000; max_timeout = root["max_timeout"] | 2000;
-        min_detection_range = root["min_detection_range"] | 0; max_detection_range = root["max_detection_range"] | 50;
-        if (mim_timeout < 100) mim_timeout = 100; if (max_timeout < mim_timeout) max_timeout = mim_timeout;
-        for (int i = 0; i < sensorList.size(); i++) webSocket.sendTXT(sensorList.get(i)->num, "{\"type\":\"blink\"}");
+        tmode               = String((const char*)root["tmode"]);
+        min_delay           = root["min_delay"]           | 0;
+        max_delay           = root["max_delay"]           | 500;
+        mim_timeout         = root["mim_timeout"]         | 1000;
+        max_timeout         = root["max_timeout"]         | 2000;
+        min_detection_range = root["min_detection_range"] | 0;
+        max_detection_range = root["max_detection_range"] | 50;
+        if (mim_timeout < 100)              mim_timeout = 100;
+        if (max_timeout < mim_timeout) max_timeout = mim_timeout;
+        for (int i = 0; i < sensorList.size(); i++)
+          webSocket.sendTXT(sensorList.get(i)->num, "{\"type\":\"blink\"}");
       }
+
       break;
     }
+
     default: break;
   }
 }
 
+// ============================================================
+// Timeout callback — no response from node within window
+// ============================================================
 void onStimulusTimeout() {
   if (!stimulating) return;
-  stimulating = false; test_errors++; sendStats();
+  stimulating = false;
+  test_errors++;
+  sendStats();
 }
