@@ -1,4 +1,4 @@
-// lib/services/bt_service.dart
+// lib/bt_service.dart
 // ============================================================
 // Handles BT Classic SPP connection to the ESP32 server.
 // Exposes a stream of parsed JSON maps to the rest of the app.

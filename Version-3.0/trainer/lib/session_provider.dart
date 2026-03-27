@@ -1,4 +1,4 @@
-// lib/services/session_provider.dart
+// lib/session_provider.dart
 // ============================================================
 // Holds live session state. Listens to BtService message stream
 // and updates stats, node list, and persists to DB on stop.
@@ -8,7 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'bt_service.dart';
 import 'database_service.dart';
-import '../models/db_models.dart';
+import 'models/db_models.dart';
 
 class NodeInfo {
   final int    nodeId;
@@ -174,7 +174,7 @@ class SessionProvider extends ChangeNotifier {
       'tmode':                mode,
       'min_delay':            minDelay,
       'max_delay':            maxDelay,
-      'mim_timeout':          minTimeout,
+'min_timeout':          minTimeout,
       'max_timeout':          maxTimeout,
       'min_detection_range':  minDetection,
       'max_detection_range':  maxDetection,
