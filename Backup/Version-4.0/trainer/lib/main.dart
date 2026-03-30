@@ -1,28 +1,19 @@
+// lib/main.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'bt_service.dart';
-import 'session_provider.dart';
+import 'services/bt_service.dart';
+import 'services/session_provider.dart';
 import 'screens/connect_screen.dart';
-import 'screens/test_screen.dart';
-import 'screens/history_screen.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await [
-    Permission.bluetooth,
-    Permission.bluetoothScan,
-    Permission.bluetoothAdvertise,
-    Permission.bluetoothConnect,
-    Permission.location,
-  ].request();
-
   runApp(
     MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => BtService()),
-        ChangeNotifierProvider(
-          create: (ctx) => SessionProvider(ctx.read<BtService>()),
+        ChangeNotifierProxyProvider<BtService, SessionProvider>(
+          create:  (ctx) => SessionProvider(ctx.read<BtService>()),
+          update:  (ctx, bt, prev) => prev ?? SessionProvider(bt),
         ),
       ],
       child: const TrainerLightsApp(),
@@ -38,39 +29,18 @@ class TrainerLightsApp extends StatelessWidget {
     return MaterialApp(
       title: 'TrainerLights',
       debugShowCheckedModeBanner: false,
-      theme: lightTheme(),
-      darkTheme: darkTheme(),
-      themeMode: ThemeMode.system,
-      initialRoute: '/',
-      routes: {
-        '/': (ctx) => const ConnectScreen(),
-      },
-      onGenerateRoute: (settings) {
-        if (settings.name!.startsWith('/test/')) {
-          final id = int.tryParse(settings.name!.split('/').last);
-          if (id != null) {
-            return MaterialPageRoute(
-              builder: (ctx) => TestScreen(athleteId: id),
-            );
-          }
-        } else if (settings.name!.startsWith('/history/')) {
-          final id = int.tryParse(settings.name!.split('/').last);
-          if (id != null) {
-            return MaterialPageRoute(
-              builder: (ctx) => HistoryScreen(athleteId: id),
-            );
-          }
-        }
-        return null;
-      },
+      theme:     _lightTheme(),
+      darkTheme: _darkTheme(),
+      themeMode: ThemeMode.system,   // follows device dark/light setting
+      home: const ConnectScreen(),
     );
   }
 
-  static ThemeData lightTheme() => ThemeData(
-    useMaterial3: true,
+  ThemeData _lightTheme() => ThemeData(
+    useMaterial3:  true,
     colorSchemeSeed: const Color(0xFF007AFF),
-    brightness: Brightness.light,
-    cardTheme: CardThemeData(
+    brightness:    Brightness.light,
+    cardTheme:     CardTheme(
       elevation: 0,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       color: Colors.white,
@@ -86,11 +56,11 @@ class TrainerLightsApp extends StatelessWidget {
     ),
   );
 
-  static ThemeData darkTheme() => ThemeData(
-    useMaterial3: true,
+  ThemeData _darkTheme() => ThemeData(
+    useMaterial3:  true,
     colorSchemeSeed: const Color(0xFF007AFF),
-    brightness: Brightness.dark,
-    cardTheme: CardThemeData(
+    brightness:    Brightness.dark,
+    cardTheme:     CardTheme(
       elevation: 0,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       color: const Color(0xFF1C1C1E),
